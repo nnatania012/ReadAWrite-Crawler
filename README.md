@@ -44,7 +44,7 @@ N.txt        -> verified, atomically written, recorded in the manifest
 - Chromium, installed through Playwright
 
 ```bash
-pip install beautifulsoup4 requests playwright
+pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
@@ -59,9 +59,17 @@ python pipeline.py chapters.html
 
 No other arguments are needed. Chat or Lec format, output folder, filenames, retries and resume are all handled automatically.
 
+To choose the output folder name yourself, add the optional `-o` / `--output` argument:
+
+```bash
+python pipeline.py chapters.html -o "My Story"
+```
+
+The folder is created next to the input file (an absolute path is also accepted). If that folder already holds a different story's progress, the pipeline uses `<name>_<hash>` instead of mixing the two. If you use custom folder names, add them to `.gitignore` so the extracted text stays out of the repository.
+
 ### Output
 
-Output goes in a folder next to the input file, named after it (`chapters.html` becomes `chapters_output/`):
+Output goes in a folder next to the input file, named after it by default (`chapters.html` becomes `chapters_output/`), or whatever you pass with `-o`:
 
 ```text
 chapters_output/

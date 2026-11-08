@@ -4,6 +4,7 @@ pipeline.py
 Fully automated ReadAWrite chapter extraction pipeline.
 
     python pipeline.py chapters.html
+    python pipeline.py chapters.html -o MyStory      (optional folder name)
 
 Sequence (strictly one chapter at a time):
 
@@ -14,7 +15,8 @@ Sequence (strictly one chapter at a time):
         verify   -> N.txt (atomic write)
         manifest -> pipeline_state.json (atomic write)
 
-Output is written beside the input file, in "<input name>_output/":
+Output is written beside the input file, in "<input name>_output/" (or in
+the folder given with -o/--output):
 
     chapters_output/
         input.html            working copy of the last fetched chapter
@@ -337,21 +339,27 @@ def has_numbered_outputs(directory: Path) -> bool:
 def resolve_output_dir(
     input_path: Path,
     list_hash: str,
+    output_name: Optional[str] = None,
 ) -> tuple[Path, Optional[dict]]:
     """
     Choose the output directory for this exact chapter list.
 
-    1. "<name>_output"            - used when new/empty, or when its manifest
+    output_name is the optional -o/--output value. A plain name is created
+    beside the input file; an absolute path is used as given. When it is not
+    supplied, the folder is "<input name>_output".
+
+    1. base folder                - used when new/empty, or when its manifest
                                     has the same chapter-list fingerprint.
-    2. "<name>_output_<hash8>"    - used when the first directory belongs to
+    2. "<base>_<hash8>"           - used when the base folder belongs to
                                     a different chapter list.
 
     The same chapter list therefore always maps to the same directory, and
     two different lists never share one.
     """
 
-    base = input_path.parent / f"{input_path.stem}_output"
-    separate = input_path.parent / f"{input_path.stem}_output_{list_hash[:8]}"
+    base_name = output_name or f"{input_path.stem}_output"
+    base = input_path.parent / base_name
+    separate = base.with_name(f"{base.name}_{list_hash[:8]}")
 
     for candidate, is_last in ((base, False), (separate, True)):
         if not candidate.exists():
@@ -465,8 +473,10 @@ class BrowserSession:
 # ============================================================
 
 class Pipeline:
-    def __init__(self, input_path: Path) -> None:
+    def __init__(self, input_path: Path,
+                 output_name: Optional[str] = None) -> None:
         self.input_path = input_path
+        self.output_name = output_name
         self.urls: list[str] = []
         self.list_hash = ""
         self.output_dir: Path = input_path.parent
@@ -488,7 +498,7 @@ class Pipeline:
         self.list_hash = fingerprint(self.urls)
 
         self.output_dir, existing = resolve_output_dir(
-            self.input_path, self.list_hash
+            self.input_path, self.list_hash, self.output_name
         )
 
         (self.output_dir / LOG_DIR_NAME).mkdir(parents=True, exist_ok=True)
@@ -1071,7 +1081,21 @@ def main() -> int:
         help="Chapter-list HTML file (e.g. chapters.html).",
     )
 
+    parser.add_argument(
+        "-o",
+        "--output",
+        metavar="OUTPUT_FOLDER_NAME",
+        default=None,
+        help=(
+            "Optional name for the output folder (created beside the "
+            "input file). Default: <input name>_output."
+        ),
+    )
+
     args = parser.parse_args()
+
+    if args.output is not None and not args.output.strip():
+        parser.error("-o/--output must not be empty")
 
     input_path = Path(args.chapters_html).expanduser().resolve()
 
@@ -1084,7 +1108,7 @@ def main() -> int:
     print()
     print(f"Input: {input_path.name}")
 
-    pipeline = Pipeline(input_path)
+    pipeline = Pipeline(input_path, args.output.strip() if args.output else None)
 
     try:
         print("Extracting chapter URLs...")
