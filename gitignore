@@ -1,0 +1,27 @@
+# --- Generated pipeline output (story text, logs, progress) ---
+*_output/
+*_output_*/
+
+# --- Saved/fetched HTML (chapter lists and rendered chapters) ---
+*.html
+*.htm
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
