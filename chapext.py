@@ -4,6 +4,14 @@ rwchapters.py
 
 Extract every chapter URL from a ReadAWrite chapter-list HTML page.
 
+Collapsed chapter groups:
+    Long stories show only the first chapters; the rest sit behind grey
+    "#11 - #21" group bars (tr.group_get_chapter, is_loaded="false") whose
+    chapter rows are only loaded by the site's JavaScript when the bar is
+    clicked. HTML saved before clicking therefore lacks those chapters.
+    find_unloaded_groups() detects this so callers never silently accept an
+    incomplete chapter list.
+
 Supported chapter-row structures:
 1. .chatChapterTableRow.notChapterStatus3
 2. .articleTableContent .table-content-row
@@ -18,6 +26,9 @@ Usage:
 
     python rwchapters.py "https://www.readawrite.com/a/ARTICLE_ID"
 
+Library use (pipeline.py passes already-rendered HTML directly):
+    links = extract_chapter_links(html, base_url="https://www.readawrite.com/a/ID")
+
 Dependencies:
     pip install beautifulsoup4 requests
 """
@@ -26,7 +37,7 @@ import argparse
 import re
 import sys
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -36,6 +47,12 @@ CHAPTER_ROW_SELECTORS = [
     ".chatChapterTableRow.notChapterStatus3",
     ".articleTableContent .table-content-row",
 ]
+
+# Collapsed chapter groups (see module docstring).
+GROUP_ROW_SELECTOR = "tr.group_get_chapter"
+GROUP_HEADER_SELECTOR = "td.tdGroupChapter"
+GROUP_CONTENT_ROW_SELECTOR = ".chatChapterTableRow"
+GROUP_ID_PATTERN = re.compile(r"^group_(\d+)_(\d+)$")
 
 CHAPTER_URL_PATTERN = re.compile(
     r"""window\s*\.\s*location\s*\.\s*href\s*=\s*(['"])(.*?)\1""",
@@ -79,8 +96,13 @@ def load_html(source):
     raise UnicodeError(f"Unable to decode HTML file: {source}")
 
 
-def extract_url_from_onclick(onclick):
-    """Extract the URL assigned to window.location.href."""
+def extract_url_from_onclick(onclick, base_url=None):
+    """
+    Extract the URL assigned to window.location.href.
+
+    If base_url is given, a relative URL is resolved against it. Without
+    base_url, only absolute URLs are accepted (the original behaviour).
+    """
 
     if not onclick:
         return None
@@ -91,6 +113,9 @@ def extract_url_from_onclick(onclick):
         return None
 
     url = match.group(2).strip()
+
+    if base_url:
+        url = urljoin(base_url, url)
 
     # Only accept ReadAWrite chapter URLs.
     parsed = urlparse(url)
@@ -132,8 +157,13 @@ def find_chapter_rows(soup):
     return rows
 
 
-def extract_chapter_links(html):
-    """Extract all chapter links in document order, without duplicates."""
+def extract_chapter_links(html, base_url=None):
+    """
+    Extract all chapter links in document order, without duplicates.
+
+    base_url (optional) is the address of the page the HTML came from; it is
+    used to turn relative chapter URLs into absolute ones.
+    """
 
     soup = BeautifulSoup(html, "html.parser")
 
@@ -144,7 +174,7 @@ def extract_chapter_links(html):
 
     for row in rows:
         onclick = row.get("onclick", "")
-        url = extract_url_from_onclick(onclick)
+        url = extract_url_from_onclick(onclick, base_url)
 
         if not url or url in seen_links:
             continue
@@ -153,6 +183,50 @@ def extract_chapter_links(html):
         links.append(url)
 
     return links
+
+
+def find_unloaded_groups(html):
+    """
+    Return the collapsed chapter groups whose chapters are NOT in the HTML.
+
+    Each item is a dict: {"id": "group_10_20", "label": "#11 - #21",
+    "expected_rows": 11}. An empty list means every group has been loaded
+    (or the page has no groups).
+    """
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    groups = []
+
+    for row in soup.select(GROUP_ROW_SELECTOR):
+        if str(row.get("is_loaded", "")).strip().lower() == "true":
+            continue
+
+        group_id = row.get("id", "")
+        label_element = row.select_one(".txtGreenBlue")
+
+        label = (
+            label_element.get_text(" ", strip=True)
+            if label_element else group_id
+        )
+
+        match = GROUP_ID_PATTERN.match(group_id)
+        expected = (
+            int(match.group(2)) - int(match.group(1)) + 1
+            if match else None
+        )
+
+        groups.append(
+            {"id": group_id, "label": label, "expected_rows": expected}
+        )
+
+    return groups
+
+
+def describe_unloaded_groups(groups):
+    """Short human-readable list such as '#11 - #21, #22 - #32'."""
+
+    return ", ".join(group["label"] for group in groups)
 
 
 def save_links(links, output_path):
@@ -185,7 +259,23 @@ def main():
 
     try:
         html = load_html(args.source)
-        links = extract_chapter_links(html)
+        is_url = args.source.lower().startswith(("http://", "https://"))
+        links = extract_chapter_links(
+            html, base_url=args.source if is_url else None
+        )
+
+        unloaded = find_unloaded_groups(html)
+
+        if unloaded:
+            print(
+                f"WARNING: {len(unloaded)} collapsed chapter group(s) were "
+                f"not expanded ({describe_unloaded_groups(unloaded)}). "
+                "Their chapters are NOT in this HTML, so the list below is "
+                "incomplete. Expand the grey bars before saving the page, "
+                "or use pipeline.py with the page URL (it expands them "
+                "automatically).",
+                file=sys.stderr,
+            )
 
         if not links:
             print("No chapter links were found.", file=sys.stderr)

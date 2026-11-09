@@ -3,22 +3,29 @@ pipeline.py
 
 Fully automated ReadAWrite chapter extraction pipeline.
 
-    python pipeline.py chapters.html
-    python pipeline.py chapters.html -o MyStory      (optional folder name)
+    python pipeline.py "https://www.readawrite.com/..."
+    python pipeline.py "https://www.readawrite.com/..." -o MyStory
+
+The only required input is the URL of the online chapter-list page. (A
+locally saved chapter-list HTML file is still accepted in place of the URL,
+which is handy for offline testing.)
 
 Sequence (strictly one chapter at a time):
 
-    chapters.html --chapext--> ordered chapter URLs
+    chapter-list URL --Chromium--> rendered chapter-list HTML
+    rendered HTML    --chapext---> ordered chapter URLs
     for each chapter N:
         rwfetch  -> rendered HTML  (input.html)
         rwext    -> detect Chat/Lec, extract text
         verify   -> N.txt (atomic write)
         manifest -> pipeline_state.json (atomic write)
 
-Output is written beside the input file, in "<input name>_output/" (or in
-the folder given with -o/--output):
+Output is written to a folder named after the story page, e.g.
+"<ARTICLE_ID>_output/" (or the folder given with -o/--output), created in the
+current directory. For a local HTML file input, the folder is created beside
+that file as "<file name>_output/".
 
-    chapters_output/
+    <name>_output/
         input.html            working copy of the last fetched chapter
         1.txt, 2.txt, ...     extracted chapters (original chapter numbers)
         pipeline_state.json   progress manifest (used for automatic resume)
@@ -30,7 +37,8 @@ Install:
 
 Exit codes:
     0    every chapter is complete
-    1    input/setup error (nothing was processed)
+    1    input/setup error, or the chapter list could not be retrieved
+         (nothing was processed)
     2    finished, but some chapters are failed/partial/not processed
     130  interrupted with Ctrl+C (run again to resume)
 """
@@ -42,6 +50,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import logging.handlers
 import os
 import re
 import signal
@@ -59,6 +68,7 @@ try:
     import chapext
     import rwext
     import rwfetch
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
     from rwfetch import FetchResult, FetchStatus
 except ImportError as import_error:
     sys.exit(
@@ -79,6 +89,20 @@ RETRY_DELAYS_SECONDS = (2, 5)        # before attempt 2, before attempt 3
 INTER_CHAPTER_DELAY_SECONDS = 1.5    # politeness delay between chapters
 MAX_CONSECUTIVE_ACCESS_DENIALS = 3   # stop if the site keeps refusing us
 BROWSER_RESTART_ATTEMPTS = 2
+
+# Chapter-list page retrieval
+LIST_NAVIGATION_TIMEOUT_MS = 60_000
+LIST_NETWORK_IDLE_TIMEOUT_MS = 10_000
+LIST_FIRST_LINKS_TIMEOUT_S = 60.0    # wait for the first chapter links
+LIST_POLL_SECONDS = 1.0
+LIST_STABLE_ROUNDS = 3               # consecutive unchanged link counts
+LIST_MAX_SCROLL_ROUNDS = 60          # scroll-to-bottom rounds (lazy loading)
+
+# Collapsed chapter groups ("#11 - #21" grey bars)
+GROUP_LOAD_TIMEOUT_MS = 15_000       # wait for one group's chapters to load
+GROUP_CLICK_ATTEMPTS = 3
+GROUP_DELAY_SECONDS = 0.5            # politeness delay between groups
+GROUP_MAX_ROUNDS = 10                # re-scan in case new groups appear
 
 STATE_FILE_NAME = "pipeline_state.json"
 STATE_VERSION = 1
@@ -196,7 +220,7 @@ class StopFlag:
 # ============================================================
 
 class InputError(Exception):
-    """A problem with the user's input file (reported before Chromium)."""
+    """A problem with the user's input (file or URL)."""
 
 
 def is_valid_chapter_url(url: str) -> bool:
@@ -210,8 +234,84 @@ def is_valid_chapter_url(url: str) -> bool:
     )
 
 
+def is_http_url(text: str) -> bool:
+    return text.lower().startswith(("http://", "https://"))
+
+
+def validate_list_url(text: str) -> str:
+    """Validate the chapter-list URL given on the command line."""
+
+    url = text.strip()
+
+    if re.search(r"\s", url):
+        raise InputError(f"The URL contains whitespace: {url!r}")
+
+    parsed = urlparse(url)
+
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise InputError(
+            f"Not a valid http(s) URL: {url!r}. Include the full address, "
+            "for example https://www.readawrite.com/a/ARTICLE_ID"
+        )
+
+    return url
+
+
+def folder_name_for_url(url: str) -> str:
+    """Default output-folder name for a chapter-list URL."""
+
+    parsed = urlparse(url)
+    segments = [seg for seg in parsed.path.split("/") if seg]
+
+    candidate = segments[-1] if segments else parsed.netloc
+    candidate = re.sub(r"[^A-Za-z0-9._-]+", "_", candidate).strip("._")
+
+    return f"{candidate or 'chapters'}_output"
+
+
+def urls_from_html(html: str, base_url: Optional[str] = None) -> list[str]:
+    """
+    Reuse chapext to extract the chapter URLs from chapter-list HTML
+    (a saved file's content or the rendered page), then validate them.
+    """
+
+    unloaded = chapext.find_unloaded_groups(html)
+
+    if unloaded:
+        raise InputError(
+            f"{len(unloaded)} collapsed chapter group(s) were never "
+            f"expanded ({chapext.describe_unloaded_groups(unloaded)}), so "
+            "this HTML only contains the chapters that were visible. "
+            "Run the pipeline with the chapter-list page URL (it expands "
+            "the groups automatically), or expand every grey bar in your "
+            "browser and save the page again."
+        )
+
+    links = chapext.extract_chapter_links(html, base_url=base_url)
+
+    # chapext already removes duplicates; do it again defensively while
+    # keeping the original order.
+    links = list(dict.fromkeys(links))
+
+    if not links:
+        raise InputError(
+            "No chapter links were found. Check that this is a ReadAWrite "
+            "chapter-list page with a supported structure."
+        )
+
+    invalid = [link for link in links if not is_valid_chapter_url(link)]
+
+    if invalid:
+        raise InputError(
+            f"{len(invalid)} extracted URL(s) are not valid ReadAWrite "
+            f"chapter URLs, for example: {invalid[0]}"
+        )
+
+    return links
+
+
 def load_chapter_urls(input_path: Path) -> list[str]:
-    """Reuse chapext to read the chapter list, then validate it."""
+    """Read a locally saved chapter-list HTML file."""
 
     if not input_path.exists():
         raise InputError(f"Input file not found: {input_path}")
@@ -224,27 +324,408 @@ def load_chapter_urls(input_path: Path) -> list[str]:
     except (OSError, UnicodeError) as error:
         raise InputError(f"Could not read {input_path}: {error}")
 
-    links = chapext.extract_chapter_links(html)
+    return urls_from_html(html)
 
-    # chapext already removes duplicates; do it again defensively while
-    # keeping the original order.
-    links = list(dict.fromkeys(links))
 
-    if not links:
-        raise InputError(
-            "No chapter links were found. Check that the HTML is a "
-            "ReadAWrite chapter-list page with a supported structure."
+# ============================================================
+# CHAPTER-LIST PAGE RETRIEVAL (online URL -> rendered HTML)
+# ============================================================
+
+def _http_problem(
+    status: Optional[int],
+    requested_url: str,
+    final_url: str,
+) -> Optional[FetchResult]:
+    """Map an HTTP status / login redirect to a FAILED result, or None."""
+
+    if status in (401, 403):
+        return FetchResult(
+            status=FetchStatus.FAILED,
+            detail=(
+                f"HTTP {status}: the site is restricting access "
+                "(login or permission required)"
+            ),
+            http_status=status, retryable=False, auth_required=True,
         )
 
-    invalid = [link for link in links if not is_valid_chapter_url(link)]
-
-    if invalid:
-        raise InputError(
-            f"{len(invalid)} extracted URL(s) are not valid ReadAWrite "
-            f"chapter URLs, for example: {invalid[0]}"
+    if rwfetch._looks_like_login(requested_url, final_url):
+        return FetchResult(
+            status=FetchStatus.FAILED,
+            detail="Redirected to a login page: this page requires a "
+                   "signed-in account",
+            http_status=status, retryable=False, auth_required=True,
         )
 
-    return links
+    if status in (404, 410):
+        return FetchResult(
+            status=FetchStatus.FAILED,
+            detail=f"HTTP {status}: page not found",
+            http_status=status, retryable=False,
+        )
+
+    if status is not None and (status == 429 or status >= 500):
+        return FetchResult(
+            status=FetchStatus.FAILED,
+            detail=f"HTTP {status} from the server",
+            http_status=status, retryable=True,
+        )
+
+    return None
+
+
+UNLOADED_GROUP_IDS_JS = """(selector) =>
+    Array.from(document.querySelectorAll(selector))
+        .filter(el => el.getAttribute('is_loaded') !== 'true')
+        .map(el => el.id)
+"""
+
+GROUP_LOADED_JS = """(id) => {
+    const el = document.getElementById(id);
+    return !!el && el.getAttribute('is_loaded') === 'true';
+}"""
+
+GROUP_ROW_COUNTS_JS = """([selector, rowSelector]) =>
+    Array.from(document.querySelectorAll(selector)).map(el => ({
+        id: el.id,
+        rows: el.querySelectorAll(rowSelector).length
+    }))
+"""
+
+
+async def expand_collapsed_groups(page) -> tuple[int, list[str]]:
+    """
+    Click every collapsed chapter group ("#11 - #21" grey bar) so the site's
+    own JavaScript loads its chapters, exactly like a reader clicking it.
+
+    A group is only clicked while its is_loaded attribute is not "true"
+    (clicking a loaded group would merely collapse it again). Each click is
+    verified by waiting for is_loaded to become "true"; if it doesn't, the
+    click is retried (the page's handlers may not be attached yet).
+
+    Returns (groups_expanded, ids_that_could_not_be_expanded).
+    """
+
+    expanded = 0
+    failed: list[str] = []
+
+    for _ in range(GROUP_MAX_ROUNDS):
+        pending = [
+            group_id
+            for group_id in await page.evaluate(
+                UNLOADED_GROUP_IDS_JS, chapext.GROUP_ROW_SELECTOR
+            )
+            if group_id and group_id not in failed
+        ]
+
+        if not pending:
+            break
+
+        for group_id in pending:
+            loaded = False
+
+            for click in range(1, GROUP_CLICK_ATTEMPTS + 1):
+                header = page.locator(
+                    f'[id="{group_id}"] {chapext.GROUP_HEADER_SELECTOR}'
+                ).first
+
+                try:
+                    await header.scroll_into_view_if_needed()
+                    await header.click()
+
+                    await page.wait_for_function(
+                        GROUP_LOADED_JS,
+                        arg=group_id,
+                        timeout=GROUP_LOAD_TIMEOUT_MS,
+                    )
+
+                    loaded = True
+                    break
+
+                except PlaywrightTimeoutError:
+                    log.debug(
+                        "Group %s not loaded after click %d/%d",
+                        group_id, click, GROUP_CLICK_ATTEMPTS,
+                    )
+
+            if loaded:
+                expanded += 1
+                log.debug("Expanded chapter group %s", group_id)
+                await asyncio.sleep(GROUP_DELAY_SECONDS)
+            else:
+                failed.append(group_id)
+
+    return expanded, failed
+
+
+async def short_groups(page) -> list[str]:
+    """
+    Loaded groups that hold fewer chapter rows than their id promises
+    (group_10_20 -> 11 rows). Empty list means every group is complete.
+    """
+
+    problems = []
+
+    counts = await page.evaluate(
+        GROUP_ROW_COUNTS_JS,
+        [chapext.GROUP_ROW_SELECTOR, chapext.GROUP_CONTENT_ROW_SELECTOR],
+    )
+
+    for item in counts:
+        match = chapext.GROUP_ID_PATTERN.match(item["id"])
+
+        if not match:
+            continue
+
+        expected = int(match.group(2)) - int(match.group(1)) + 1
+
+        if item["rows"] < expected:
+            problems.append(
+                f"{item['id']} has {item['rows']} of {expected} chapters"
+            )
+
+    return problems
+
+
+async def fetch_chapter_list_html(browser, url: str) -> FetchResult:
+    """
+    Open the chapter-list page in a fresh Chromium context, wait for its
+    JavaScript-generated chapter links, and return the rendered HTML.
+
+    Completion is decided by chapext's own extraction rules, not by sleeping:
+    the page is re-read until chapter links (or collapsed chapter groups)
+    exist, every collapsed group is clicked open so its chapters load, then
+    the page is scrolled to the bottom (in case the list loads lazily) until
+    the number of extracted links stops changing. A list with unexpanded or
+    incomplete groups is never reported as SUCCESS.
+
+    SUCCESS  - links found and the count was stable.
+    PARTIAL  - links found, but the count was still changing at the end.
+    FAILED   - navigation/HTTP problem, or no chapter links ever appeared.
+    """
+
+    context = None
+    page = None
+    crashed = {"flag": False}
+
+    try:
+        context = await browser.new_context(
+            locale="en-US",
+            viewport={"width": 1440, "height": 1000},
+        )
+
+        page = await context.new_page()
+        page.set_default_timeout(20_000)
+
+        page.on(
+            "pageerror",
+            lambda error: log.debug("[Browser JavaScript error] %s", error),
+        )
+
+        def on_crash(_page) -> None:
+            crashed["flag"] = True
+
+        page.on("crash", on_crash)
+
+        log.debug("Opening chapter-list page: %s", url)
+
+        response = await page.goto(
+            url,
+            wait_until="domcontentloaded",
+            timeout=LIST_NAVIGATION_TIMEOUT_MS,
+        )
+
+        status = response.status if response is not None else None
+
+        problem = _http_problem(status, url, page.url)
+
+        if problem is not None:
+            return problem
+
+        if status is not None and status >= 400:
+            log.warning("The chapter-list page returned HTTP %s; "
+                        "continuing.", status)
+
+        # Best effort: let the page's own requests settle. Not required.
+        try:
+            await page.wait_for_load_state(
+                "networkidle", timeout=LIST_NETWORK_IDLE_TIMEOUT_MS
+            )
+        except PlaywrightTimeoutError:
+            log.debug("Network did not go idle; continuing.")
+
+        loop = asyncio.get_running_loop()
+
+        def count_links(html: str) -> int:
+            return len(
+                chapext.extract_chapter_links(html, base_url=page.url)
+            )
+
+        def has_content(html: str) -> bool:
+            # Visible chapter rows, or collapsed groups still to be opened.
+            return (
+                count_links(html) > 0
+                or bool(chapext.find_unloaded_groups(html))
+            )
+
+        # ---- 1. wait until chapter links / groups exist ------------
+
+        deadline = loop.time() + LIST_FIRST_LINKS_TIMEOUT_S
+        html = await page.content()
+
+        while not has_content(html) and loop.time() < deadline:
+            await asyncio.sleep(LIST_POLL_SECONDS)
+            html = await page.content()
+
+        # ---- 2. open every collapsed chapter group -----------------
+
+        groups_expanded, groups_failed = await expand_collapsed_groups(page)
+
+        html = await page.content()
+        count = count_links(html)
+
+        if count == 0 and groups_failed:
+            return FetchResult(
+                status=FetchStatus.FAILED,
+                detail=(
+                    f"Could not expand {len(groups_failed)} collapsed "
+                    f"chapter group(s) ({', '.join(groups_failed)}) and no "
+                    "chapters were visible"
+                ),
+                html=html,
+                http_status=status,
+                retryable=True,
+            )
+
+        if count == 0:
+            problem = _http_problem(None, url, page.url)
+
+            if problem is not None:
+                return problem
+
+            return FetchResult(
+                status=FetchStatus.FAILED,
+                detail=(
+                    "No chapter links appeared on the page. The page may "
+                    "need a login, its structure may not be supported, or "
+                    "its content did not finish loading"
+                ),
+                html=html,
+                http_status=status,
+                retryable=True,
+            )
+
+        # ---- 3. scroll until the link count stops changing ---------
+
+        stable = 0
+        rounds = 0
+
+        while stable < LIST_STABLE_ROUNDS and rounds < LIST_MAX_SCROLL_ROUNDS:
+            await page.evaluate(
+                "() => window.scrollTo(0, "
+                "document.documentElement.scrollHeight)"
+            )
+            await asyncio.sleep(LIST_POLL_SECONDS)
+
+            html = await page.content()
+            new_count = count_links(html)
+
+            if new_count == count:
+                stable += 1
+            else:
+                stable = 0
+                count = new_count
+
+            rounds += 1
+
+        log.debug("Chapter list: %d link(s) after %d scroll round(s), "
+                  "stable=%s", count, rounds, stable >= LIST_STABLE_ROUNDS)
+
+        # ---- 4. verify the list is complete ------------------------
+
+        late_groups, late_failed = await expand_collapsed_groups(page)
+        groups_expanded += late_groups
+        groups_failed = list(dict.fromkeys(groups_failed + late_failed))
+
+        if late_groups:
+            html = await page.content()
+            count = count_links(html)
+
+        leftover = chapext.find_unloaded_groups(html)
+        short = await short_groups(page)
+
+        stats = {"groups_expanded": groups_expanded}
+
+        problem_text = None
+
+        if groups_failed or leftover:
+            names = chapext.describe_unloaded_groups(leftover) or ", ".join(
+                groups_failed
+            )
+            problem_text = (
+                f"Could not expand {max(len(leftover), len(groups_failed))} "
+                f"collapsed chapter group(s) ({names}); the list would be "
+                "missing chapters"
+            )
+        elif short:
+            problem_text = (
+                "A chapter group loaded fewer chapters than expected ("
+                + "; ".join(short) + ")"
+            )
+        elif stable < LIST_STABLE_ROUNDS:
+            problem_text = (
+                f"The chapter list was still growing after "
+                f"{rounds} scroll rounds ({count} links so far)"
+            )
+
+        if problem_text:
+            return FetchResult(
+                status=FetchStatus.PARTIAL,
+                detail=problem_text,
+                html=html,
+                layout="ChapterList",
+                http_status=status,
+                expected_items=count,
+                rendered_items=count,
+                stats=stats,
+            )
+
+        return FetchResult(
+            status=FetchStatus.SUCCESS,
+            html=html,
+            layout="ChapterList",
+            http_status=status,
+            expected_items=count,
+            rendered_items=count,
+            stats=stats,
+        )
+
+    except PlaywrightTimeoutError as error:
+        return FetchResult(
+            status=FetchStatus.FAILED,
+            detail=f"Timeout: {str(error).splitlines()[0]}",
+            browser_crashed=crashed["flag"],
+        )
+
+    except Exception as error:
+        first_line = (str(error).splitlines() or [""])[0]
+
+        return FetchResult(
+            status=FetchStatus.FAILED,
+            detail=f"{type(error).__name__}: {first_line}",
+            browser_crashed=(
+                crashed["flag"] or rwfetch._is_crash_error(error)
+            ),
+        )
+
+    finally:
+        for closable in (page, context):
+            if closable is None:
+                continue
+
+            try:
+                await asyncio.wait_for(closable.close(), timeout=10)
+            except Exception as error:
+                log.debug("Ignoring close error: %r", error)
 
 
 # ============================================================
@@ -337,7 +818,8 @@ def has_numbered_outputs(directory: Path) -> bool:
 
 
 def resolve_output_dir(
-    input_path: Path,
+    base_dir: Path,
+    default_name: str,
     list_hash: str,
     output_name: Optional[str] = None,
 ) -> tuple[Path, Optional[dict]]:
@@ -345,8 +827,8 @@ def resolve_output_dir(
     Choose the output directory for this exact chapter list.
 
     output_name is the optional -o/--output value. A plain name is created
-    beside the input file; an absolute path is used as given. When it is not
-    supplied, the folder is "<input name>_output".
+    inside base_dir; an absolute path is used as given. When it is not
+    supplied, default_name is used.
 
     1. base folder                - used when new/empty, or when its manifest
                                     has the same chapter-list fingerprint.
@@ -357,8 +839,8 @@ def resolve_output_dir(
     two different lists never share one.
     """
 
-    base_name = output_name or f"{input_path.stem}_output"
-    base = input_path.parent / base_name
+    base_name = output_name or default_name
+    base = base_dir / base_name
     separate = base.with_name(f"{base.name}_{list_hash[:8]}")
 
     for candidate, is_last in ((base, False), (separate, True)):
@@ -386,7 +868,7 @@ def resolve_output_dir(
             return candidate, None
 
     raise InputError(
-        f"Could not choose a safe output directory for {input_path.name}."
+        f"Could not choose a safe output directory under {base_dir}."
     )
 
 
@@ -473,13 +955,35 @@ class BrowserSession:
 # ============================================================
 
 class Pipeline:
-    def __init__(self, input_path: Path,
+    def __init__(self, source: str,
                  output_name: Optional[str] = None) -> None:
-        self.input_path = input_path
         self.output_name = output_name
+        self.list_url: Optional[str] = None
+        self.input_path: Optional[Path] = None
+
+        if is_http_url(source):
+            self.list_url = validate_list_url(source)
+            self.source_label = self.list_url
+            self.base_dir = Path.cwd()
+            self.default_folder = folder_name_for_url(self.list_url)
+        else:
+            path = Path(source).expanduser()
+
+            if not path.exists():
+                raise InputError(
+                    f"{source!r} is neither an http(s) URL nor an existing "
+                    "file. Pass the chapter-list page URL, e.g. "
+                    "https://www.readawrite.com/a/ARTICLE_ID"
+                )
+
+            self.input_path = path.resolve()
+            self.source_label = self.input_path.name
+            self.base_dir = self.input_path.parent
+            self.default_folder = f"{self.input_path.stem}_output"
+
         self.urls: list[str] = []
         self.list_hash = ""
-        self.output_dir: Path = input_path.parent
+        self.output_dir: Path = self.base_dir
         self.state: Optional[State] = None
         self.session = BrowserSession()
         self.stop = StopFlag()
@@ -491,14 +995,132 @@ class Pipeline:
         self.aborted_reason: Optional[str] = None
         self.access_denials_in_a_row = 0
 
-    # ---------------- setup (before Chromium) --------------------
+    # ---------------- setup --------------------------------------
+
+    def load_from_file(self) -> None:
+        """Local-file input: read and validate the chapter URLs."""
+
+        assert self.input_path is not None
+        self.urls = load_chapter_urls(self.input_path)
+
+    async def ensure_browser(self) -> None:
+        if self.session.alive:
+            return
+
+        say("Starting Chromium...")
+
+        try:
+            await self.session.start()
+        except Exception as error:
+            raise BrowserUnavailable(
+                f"Could not launch Chromium: {error}\n"
+                "If Chromium is not installed, run:\n"
+                "    python -m playwright install chromium"
+            )
+
+    async def load_from_url(self) -> None:
+        """
+        URL input: open the chapter-list page in the shared Chromium,
+        wait for its chapter links, and extract them with chapext.
+        Retries temporary problems; raises InputError when it cannot.
+        """
+
+        assert self.list_url is not None
+
+        await self.ensure_browser()
+
+        say(f"Retrieving chapter list: {self.list_url}")
+
+        last_error = "Unknown error"
+
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            if attempt > 1:
+                delay = RETRY_DELAYS_SECONDS[
+                    min(attempt - 2, len(RETRY_DELAYS_SECONDS) - 1)
+                ]
+
+                say(f"Retrying in {delay}s "
+                    f"(attempt {attempt}/{MAX_ATTEMPTS})...")
+
+                if not await self.interruptible_sleep(delay):
+                    self.interrupted = True
+                    return
+
+            if not self.session.alive:
+                await self.session.restart()
+
+            try:
+                result = await fetch_chapter_list_html(
+                    self.session.browser, self.list_url
+                )
+            except Exception as error:
+                log.debug("Unexpected chapter-list exception",
+                          exc_info=True)
+                result = FetchResult(
+                    status=FetchStatus.FAILED,
+                    detail=f"{type(error).__name__}: {error}",
+                    browser_crashed=True,
+                )
+
+            log.debug(
+                "[chapter list] [attempt %d/%d] %s status=%s links=%s "
+                "http=%s detail=%s",
+                attempt, MAX_ATTEMPTS, self.list_url,
+                result.status.value, result.rendered_items,
+                result.http_status, result.detail,
+            )
+
+            if result.browser_crashed or not self.session.alive:
+                say("Chromium crashed or disconnected; restarting it...")
+                await self.session.restart()
+
+            if result.status is FetchStatus.SUCCESS:
+                try:
+                    self.urls = urls_from_html(
+                        result.html or "", base_url=self.list_url
+                    )
+
+                    opened = result.stats.get("groups_expanded", 0)
+
+                    if opened:
+                        say(f"Expanded {opened} collapsed chapter "
+                            "group(s).")
+
+                    return
+                except InputError as error:
+                    last_error = str(error)
+            else:
+                last_error = result.detail or "Chapter list not loaded"
+
+                if not result.retryable:
+                    say(f"Chapter-list retrieval failed: {last_error}")
+                    break
+
+            say(f"Chapter-list retrieval attempt {attempt} failed: "
+                f"{last_error}")
+
+        raise InputError(
+            f"Could not retrieve the chapter list from {self.list_url}: "
+            f"{last_error}"
+        )
+
+    def announce(self) -> None:
+        say(f"Output: {self.output_dir.name}/")
+        say(f"Found {len(self.urls)} chapters.")
+        say("")
+
+        log.debug("Source: %s", self.source_label)
+        log.debug("Chapter list SHA-256: %s", self.list_hash)
 
     def prepare(self) -> None:
-        self.urls = load_chapter_urls(self.input_path)
+        """Once self.urls is known: choose the output folder, set up the
+        log file and load/create the manifest."""
+
         self.list_hash = fingerprint(self.urls)
 
         self.output_dir, existing = resolve_output_dir(
-            self.input_path, self.list_hash, self.output_name
+            self.base_dir, self.default_folder,
+            self.list_hash, self.output_name,
         )
 
         (self.output_dir / LOG_DIR_NAME).mkdir(parents=True, exist_ok=True)
@@ -516,7 +1138,7 @@ class Pipeline:
 
         if existing is not None:
             self.state = State(state_path, existing)
-            self.state.data["source_file"] = self.input_path.name
+            self.state.data["source_file"] = self.source_label
             self.state.data["total_chapters"] = len(self.urls)
 
             for number, url in enumerate(self.urls, start=1):
@@ -527,7 +1149,7 @@ class Pipeline:
                 )
         else:
             self.state = State.new(
-                state_path, self.input_path.name, self.list_hash, self.urls
+                state_path, self.source_label, self.list_hash, self.urls
             )
 
         self.state.save()
@@ -831,6 +1453,25 @@ class Pipeline:
     # ---------------- main loop ----------------------------------
 
     async def run(self) -> None:
+        """Entry point: (URL mode) retrieve the chapter list, then process
+        every chapter. Chromium is always closed on the way out."""
+
+        try:
+            if self.list_url is not None:
+                await self.load_from_url()
+
+                if self.interrupted:
+                    return
+
+                self.prepare()
+                self.announce()
+
+            await self.process()
+
+        finally:
+            await self.session.close()
+
+    async def process(self) -> None:
         state = self.state
         assert state is not None
 
@@ -876,16 +1517,7 @@ class Pipeline:
             return
 
         say("")
-        say("Starting Chromium...")
-
-        try:
-            await self.session.start()
-        except Exception as error:
-            raise BrowserUnavailable(
-                f"Could not launch Chromium: {error}\n"
-                "If Chromium is not installed, run:\n"
-                "    python -m playwright install chromium"
-            )
+        await self.ensure_browser()
 
         try:
             todo = [
@@ -943,6 +1575,11 @@ class Pipeline:
 
     def print_summary(self) -> None:
         if self.state is None:
+            if self.interrupted:
+                say("")
+                say("Interrupted before the chapter list was retrieved. "
+                    "Nothing was processed.")
+
             return
 
         state = self.state
@@ -1041,9 +1678,41 @@ class Pipeline:
 # LOGGING
 # ============================================================
 
+def bootstrap_logging() -> None:
+    """
+    Console output plus an in-memory buffer. In URL mode the chapter list is
+    retrieved before the output folder (and so the log file) exists; the
+    buffer is written to the log file as soon as it does.
+    """
+
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(logging.INFO)
+    console.setFormatter(logging.Formatter("%(message)s"))
+
+    buffer = logging.handlers.MemoryHandler(
+        capacity=100_000, flushLevel=logging.CRITICAL + 10
+    )
+
+    root.addHandler(console)
+    root.addHandler(buffer)
+
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
+
+
 def setup_logging(log_path: Path) -> None:
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
+
+    buffered = [
+        handler for handler in root.handlers
+        if isinstance(handler, logging.handlers.MemoryHandler)
+    ]
 
     for handler in list(root.handlers):
         root.removeHandler(handler)
@@ -1061,6 +1730,12 @@ def setup_logging(log_path: Path) -> None:
     root.addHandler(file_handler)
     root.addHandler(console)
 
+    # Write everything logged before the log file existed.
+    for handler in buffered:
+        handler.setTarget(file_handler)
+        handler.flush()
+        handler.close()
+
     logging.getLogger("asyncio").setLevel(logging.WARNING)
 
 
@@ -1071,14 +1746,19 @@ def setup_logging(log_path: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Fetch and extract every chapter listed in a ReadAWrite "
-            "chapter-list HTML file."
+            "Fetch and extract every chapter listed on a ReadAWrite "
+            "chapter-list page."
         )
     )
 
     parser.add_argument(
-        "chapters_html",
-        help="Chapter-list HTML file (e.g. chapters.html).",
+        "source",
+        metavar="CHAPTER_LIST_URL",
+        help=(
+            "URL of the online chapter-list page, e.g. "
+            "https://www.readawrite.com/a/ARTICLE_ID "
+            "(a locally saved chapter-list HTML file also works)."
+        ),
     )
 
     parser.add_argument(
@@ -1087,8 +1767,9 @@ def main() -> int:
         metavar="OUTPUT_FOLDER_NAME",
         default=None,
         help=(
-            "Optional name for the output folder (created beside the "
-            "input file). Default: <input name>_output."
+            "Optional name for the output folder (created in the "
+            "current directory; beside the file for a local HTML input). "
+            "Default: <page name>_output."
         ),
     )
 
@@ -1097,35 +1778,33 @@ def main() -> int:
     if args.output is not None and not args.output.strip():
         parser.error("-o/--output must not be empty")
 
-    input_path = Path(args.chapters_html).expanduser().resolve()
-
-    # Until the output directory exists, log to the console only.
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    # Until the output directory exists, log to the console and a buffer.
+    bootstrap_logging()
 
     print(BANNER)
     print("ReadAWrite Automated Chapter Pipeline")
     print(BANNER)
     print()
-    print(f"Input: {input_path.name}")
-
-    pipeline = Pipeline(input_path, args.output.strip() if args.output else None)
 
     try:
-        print("Extracting chapter URLs...")
-        pipeline.prepare()
-    except InputError as error:
+        pipeline = Pipeline(
+            args.source, args.output.strip() if args.output else None
+        )
+
+        if pipeline.list_url is not None:
+            print(f"Chapter-list URL: {pipeline.list_url}")
+            print()
+        else:
+            # Local-file input: everything can be validated before Chromium.
+            print(f"Input: {pipeline.source_label}")
+            print("Extracting chapter URLs...")
+            pipeline.load_from_file()
+            pipeline.prepare()
+            pipeline.announce()
+
+    except (InputError, OSError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
-    except OSError as error:
-        print(f"Error: {error}", file=sys.stderr)
-        return 1
-
-    say(f"Output: {pipeline.output_dir.name}/")
-    say(f"Found {len(pipeline.urls)} chapters.")
-    say("")
-
-    log.debug("Input file: %s", input_path)
-    log.debug("Chapter list SHA-256: %s", pipeline.list_hash)
 
     pipeline.stop.install()
 
@@ -1134,6 +1813,11 @@ def main() -> int:
 
     except KeyboardInterrupt:
         pipeline.interrupted = True
+
+    except InputError as error:
+        # URL mode: the chapter list could not be retrieved or parsed.
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
 
     except BrowserUnavailable as error:
         say("")
