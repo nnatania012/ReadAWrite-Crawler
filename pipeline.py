@@ -5,6 +5,7 @@ Fully automated ReadAWrite chapter extraction pipeline.
 
     python pipeline.py "https://www.readawrite.com/..."
     python pipeline.py "https://www.readawrite.com/..." -o MyStory
+    python pipeline.py "https://www.readawrite.com/..." --stop-file STOP
 
 The only required input is the URL of the online chapter-list page. (A
 locally saved chapter-list HTML file is still accepted in place of the URL,
@@ -191,11 +192,35 @@ def fingerprint(urls: list[str]) -> str:
 # ============================================================
 
 class StopFlag:
-    """First Ctrl+C = finish safely and stop; second = abort now."""
+    """
+    First Ctrl+C = finish safely and stop; second = abort now.
+
+    A stop file (--stop-file PATH) does the same as the first Ctrl+C: when the
+    file appears, the current chapter is finished and the run stops. This is
+    how the web backend cancels a job gracefully on every operating system.
+    """
 
     def __init__(self) -> None:
-        self.requested = False
+        self._requested = False
         self._count = 0
+        self.stop_file: Optional[Path] = None
+
+    @property
+    def requested(self) -> bool:
+        if not self._requested and self.stop_file is not None:
+            try:
+                if self.stop_file.exists():
+                    self._requested = True
+                    log.info("Stop file found; finishing the current "
+                             "chapter, then stopping...")
+            except OSError:
+                pass
+
+        return self._requested
+
+    @requested.setter
+    def requested(self, value: bool) -> None:
+        self._requested = value
 
     def install(self) -> None:
         def handler(signum, frame):
@@ -540,6 +565,20 @@ async def fetch_chapter_list_html(browser, url: str) -> FetchResult:
 
         if problem is not None:
             return problem
+
+        final_host = (urlparse(page.url).hostname or "").lower()
+
+        if final_host not in READAWRITE_HOSTS:
+            return FetchResult(
+                status=FetchStatus.FAILED,
+                detail=(
+                    "The page redirected to a different website "
+                    f"({final_host or 'unknown'}); only ReadAWrite pages "
+                    "are supported"
+                ),
+                http_status=status,
+                retryable=False,
+            )
 
         if status is not None and status >= 400:
             log.warning("The chapter-list page returned HTTP %s; "
@@ -1773,6 +1812,17 @@ def main() -> int:
         ),
     )
 
+    parser.add_argument(
+        "--stop-file",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Optional: stop gracefully (after the current chapter) as soon "
+            "as this file exists. Used by the web backend; not needed for "
+            "normal command-line use."
+        ),
+    )
+
     args = parser.parse_args()
 
     if args.output is not None and not args.output.strip():
@@ -1805,6 +1855,9 @@ def main() -> int:
     except (InputError, OSError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
+
+    if args.stop_file:
+        pipeline.stop.stop_file = Path(args.stop_file)
 
     pipeline.stop.install()
 

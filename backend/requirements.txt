@@ -1,0 +1,7 @@
+# Web API
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+
+# The extraction pipeline's own dependencies (pipeline.py, chapext.py, ...)
+-r ../requirements.txt

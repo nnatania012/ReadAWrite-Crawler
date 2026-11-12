@@ -1,0 +1,40 @@
+# --- Generated pipeline output (story text, logs, progress) ---
+*_output/
+*_output_*/
+
+# --- Saved/fetched HTML (chapter lists and rendered chapters) ---
+*.html
+*.htm
+!frontend/index.html
+
+# --- Backend job storage ---
+backend/data/
+data/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+
+# --- Frontend ---
+frontend/node_modules/
+frontend/dist/
+*.tsbuildinfo
+.env
+.env.local
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- end-to-end test data ---
+e2e-data/
