@@ -78,7 +78,7 @@ export interface ChapterInfo {
   format: string | null;
   filename: string | null;
   size_bytes: number | null;
-  /** Backend-verified: job finished AND this chapter extracted and intact. */
+  /** Backend-verified: this chapter is extracted and its file is intact (job may still be running). */
   copyable: boolean;
 }
 
@@ -108,7 +108,3 @@ export const canResume = (status: JobStatus): boolean =>
   status === "completed_with_errors" ||
   status === "interrupted" ||
   status === "cancelled";
-
-/** Chapters can only be copied once the whole job has completed. */
-export const isFinishedForCopy = (status: JobStatus): boolean =>
-  status === "completed" || status === "completed_with_errors";

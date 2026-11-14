@@ -61,29 +61,44 @@ async def main():
         assert await page.evaluate("localStorage.length") == 0, "nothing may be kept in localStorage"
         log(f"session {sid[:8]}… stored in sessionStorage only")
 
-        job_id = await start_job(page, "FAKEOK", "Copy Test")
-        # --- every Copy button disabled while processing
-        seen_disabled = 0
-        for _ in range(60):
-            buttons = page.locator("button[aria-label^='Copy chapter']")
-            n = await buttons.count()
-            if n >= 3 and await page.get_by_text("Now processing chapter").count():
-                for i in range(n): assert await buttons.nth(i).is_disabled(), "Copy must be disabled while running"
-                seen_disabled = n; break
-            await asyncio.sleep(0.3)
-        assert seen_disabled == 3, seen_disabled
-        log("all 3 Copy buttons are disabled while the job is processing")
-        # direct API call is also refused by the backend
-        status, body = api(f"/api/jobs/{job_id}/chapters/1/content", sid)
-        assert status == 409 and json.loads(body)["error"]["code"] == "extraction_incomplete", (status, body)
-        log("backend independently refuses copy while running (409)")
+        job_id = await start_job(page, "FAKESLOW", "Copy Test")      # 4 chapters, ~6 s each
+        btn = lambda n: page.get_by_role("button", name=f"Copy chapter {n}")
 
-        await expect(page.get_by_text("Extraction complete")).to_be_visible(timeout=60_000)
+        # --- chapter 1 becomes copyable while the job is STILL RUNNING; the others stay disabled
+        await expect(btn(1)).to_be_enabled(timeout=45_000)
+        await expect(page.get_by_text("Extracting", exact=True)).to_be_visible()
+        for n in (2, 3, 4):
+            assert await btn(n).is_disabled(), f"chapter {n} is not extracted yet"
+        log("chapter 1 is copyable as soon as it is extracted; job still running; later chapters disabled")
+        status, body = api(f"/api/jobs/{job_id}/chapters/2/content", sid)
+        err = json.loads(body)["error"]
+        assert status == 409 and err["code"] == "chapter_unavailable" and "yet" in err["message"], (status, body)
+        log("backend independently refuses a chapter that is not extracted yet (409)")
+        status, _ = api(f"/api/jobs/{job_id}/download", sid)
+        assert status == 409, "the ZIP must still wait for the whole job"
+
+        before_mid = len(downloads)
+        await btn(1).click()
+        await expect(btn(1)).to_contain_text("Copied!")
+        clip = await page.evaluate("navigator.clipboard.readText()")
+        assert clip == COMPLEX, "mid-run copy of chapter 1 differs from the TXT file"
+        assert len(downloads) == before_mid, "Copy must not download anything"
+        await expect(page.get_by_text("Extracting", exact=True)).to_be_visible()
+        log("chapter 1 copied mid-run: clipboard == TXT file exactly; job still running; no download")
+
+        await expect(btn(2)).to_be_enabled(timeout=30_000)          # next chapter finishes
+        assert await btn(3).is_disabled() and await btn(4).is_disabled()
+        await btn(2).click()
+        await expect(btn(2)).to_contain_text("Copied!")
+        assert await page.evaluate("navigator.clipboard.readText()") == TEXTS[2]
+        log("chapter 2 became copyable the moment it finished and copied exactly")
+
+        await expect(page.get_by_text("Extraction complete")).to_be_visible(timeout=90_000)
         await asyncio.sleep(1.5)
         zip_downloads_before = len(downloads)
-        for n in (1, 2, 3):
+        for n in (1, 2, 3, 4):
             assert await page.get_by_role("button", name=f"Copy chapter {n}").is_enabled()
-        log("Copy buttons enabled after completion")
+        log("all four Copy buttons enabled after completion")
 
         # --- independence + duplicate protection: delay chapter 1's response
         async def slow(route):
@@ -125,7 +140,7 @@ async def main():
         await page.get_by_role("button", name="Download All Chapters").click()
         await asyncio.sleep(2)
         z = zipfile.ZipFile(io.BytesIO(downloads[-1][1]))
-        assert z.namelist() == [f"Copy Test/{i}.txt" for i in (1, 2, 3)], z.namelist()
+        assert z.namelist() == [f"Copy Test/{i}.txt" for i in (1, 2, 3, 4)], z.namelist()
         assert z.read("Copy Test/1.txt").decode("utf-8") == COMPLEX
         log("ZIP download still works and contains the same exact text")
 

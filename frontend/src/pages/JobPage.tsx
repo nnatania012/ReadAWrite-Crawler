@@ -6,7 +6,7 @@ import { ChapterList } from "../components/ChapterList";
 import { DownloadButton } from "../components/DownloadButton";
 import { ProgressBar } from "../components/ProgressBar";
 import { JobStatusBadge } from "../components/StatusBadge";
-// import { useAutoDownload } from "../hooks/useAutoDownload";
+import { useAutoDownload } from "../hooks/useAutoDownload";
 import { useJobPolling } from "../hooks/useJobPolling";
 import { formatDateTime } from "../lib/format";
 import { clearActiveJobId } from "../lib/storage";
@@ -79,7 +79,7 @@ export function JobPage() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [downloadWarning, setDownloadWarning] = useState<string | null>(null);
 
-  // useAutoDownload(job, setDownloadWarning);
+  useAutoDownload(job, setDownloadWarning);
 
   useEffect(() => {
     if (job && isTerminal(job.status)) clearActiveJobId(job.job_id);

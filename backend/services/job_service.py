@@ -10,14 +10,13 @@ from urllib.parse import urlsplit
 
 from config import Settings
 from services.errors import (
-    ArchiveNotReady, ChapterNotFound, ChapterUnavailable, ExtractionIncomplete,
+    ArchiveNotReady, ChapterNotFound, ChapterUnavailable,
     InternalFailure, InvalidRequestError, JobConflict, JobExpired, JobNotFound,
 )
 from services.url_validation import validate_readawrite_url
 from storage.file_manager import (
-    ArchiveNotReadyError, COPYABLE_JOB_STATUSES, ChapterNotFoundError,
-    ChapterUnavailableError, ExtractionIncompleteError, FileManager,
-    FileManagerError, InvalidJobIdError, JobNotFoundError, PathEscapeError,
+    ArchiveNotReadyError, ChapterNotFoundError, ChapterUnavailableError,
+    FileManager, FileManagerError, InvalidJobIdError, JobNotFoundError, PathEscapeError,
     now_iso, sanitize_error, sanitize_name,
 )
 from worker.job_manager import IN_FLIGHT_STATUSES, JobManager
@@ -181,8 +180,7 @@ class JobService:
         }
 
     def get_chapters(self, session_id: str, job_id: str) -> list[dict]:
-        meta = self._meta(session_id, job_id)
-        finished = meta.get("status") in COPYABLE_JOB_STATUSES
+        self._meta(session_id, job_id)
 
         return [{
             "number": r.number,
@@ -192,9 +190,10 @@ class JobService:
             "format": r.format,
             "filename": r.filename,
             "size_bytes": r.size_bytes if r.status == "success" else None,
-            # Copy is offered only for a finished job and a verified chapter.
-            # (The content endpoint re-checks everything, including the SHA-256.)
-            "copyable": bool(finished and r.status == "success" and r.verified),
+            # Copy is offered for every chapter that is extracted and intact,
+            # even while the job is still running. (The content endpoint
+            # re-checks everything, including the SHA-256.)
+            "copyable": bool(r.status == "success" and r.verified),
         } for r in self.fm.chapter_records(job_id)]
 
     def get_chapter_content(self, session_id: str, job_id: str,
@@ -205,9 +204,6 @@ class JobService:
 
         try:
             return self.fm.read_chapter_bytes(job_id, chapter_number)
-        except ExtractionIncompleteError:
-            raise ExtractionIncomplete(
-                "Chapters can be copied once the extraction has finished.")
         except ChapterNotFoundError:
             raise ChapterNotFound("Chapter not found.")
         except ChapterUnavailableError as error:

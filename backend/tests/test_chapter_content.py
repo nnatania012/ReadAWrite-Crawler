@@ -115,14 +115,39 @@ def test_helper_returns_the_same_string(env):
 
 # --------------------------------------------------- job state restrictions
 
-@pytest.mark.parametrize("status", ["queued", "discovering", "processing", "packaging",
-                                    "cancelling", "cancelled", "interrupted", "failed"])
-def test_rejected_unless_the_whole_job_completed(env, status):
+ALL_JOB_STATUSES = ["queued", "discovering", "processing", "packaging", "completed",
+                    "completed_with_errors", "failed", "cancelling", "cancelled", "interrupted"]
+
+
+@pytest.mark.parametrize("status", ALL_JOB_STATUSES)
+def test_an_extracted_chapter_is_copyable_whatever_state_the_job_is_in(env, status):
+    """Copy no longer waits for the whole job: a verified chapter is readable at once."""
     client, fm = env
-    job_id = job(fm, {1: "success"}, status=status)
+    job_id = job(fm, {1: "success"}, status=status, texts={1: COMPLEX_BYTES})
     response = content(client, job_id, 1)
-    assert response.status_code == 409
-    assert response.json()["error"]["code"] == "extraction_incomplete"
+    assert response.status_code == 200 and response.content == COMPLEX_BYTES
+
+
+@pytest.mark.parametrize("status", ["queued", "discovering", "processing", "packaging"])
+def test_chapters_not_extracted_yet_are_refused_while_the_job_runs(env, status):
+    client, fm = env
+    job_id = job(fm, {1: "success", 2: "in_progress", 3: "pending"}, status=status)
+    assert content(client, job_id, 1).status_code == 200
+    for n in (2, 3):
+        response = content(client, job_id, n)
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "chapter_unavailable"
+        assert "yet" in response.json()["error"]["message"]
+
+
+def test_a_job_that_has_produced_no_manifest_yet_has_no_chapters(env):
+    client, fm = env
+    job_id = fm.create_job_dir()
+    fm.write_job(job_id, {"job_id": job_id, "session_id": SESSION, "output_name": "x",
+                          "source_url": "https://www.readawrite.com/a/x", "status": "queued",
+                          "created_at": "2026-01-01T00:00:00+00:00",
+                          "updated_at": "2026-01-01T00:00:00+00:00"})
+    assert content(client, job_id, 1).status_code == 404
 
 
 @pytest.mark.parametrize("status", ["completed", "completed_with_errors"])
@@ -257,11 +282,21 @@ def test_status_and_chapter_endpoints_never_contain_chapter_text(env):
     assert secret not in client.get("/api/jobs").text
 
 
-def test_copyable_is_false_everywhere_until_the_job_has_completed(env):
+def test_copyable_flags_follow_each_chapter_while_the_job_is_still_running(env):
+    client, fm = env
+    job_id = job(fm, {1: "success", 2: "success", 3: "in_progress", 4: "pending", 5: "failed"},
+                 status="processing")
+    chapters = client.get(f"/api/jobs/{job_id}/chapters").json()["chapters"]
+    assert {c["number"]: c["copyable"] for c in chapters} == {
+        1: True, 2: True, 3: False, 4: False, 5: False}
+
+
+def test_a_chapter_whose_file_is_damaged_is_not_offered_even_mid_run(env):
     client, fm = env
     job_id = job(fm, {1: "success", 2: "success"}, status="processing")
+    (fm.output_dir(job_id) / "2.txt").unlink()
     chapters = client.get(f"/api/jobs/{job_id}/chapters").json()["chapters"]
-    assert [c["copyable"] for c in chapters] == [False, False]
+    assert {c["number"]: c["copyable"] for c in chapters} == {1: True, 2: False}
 
 
 def test_errors_never_leak_server_paths(env):

@@ -43,7 +43,6 @@ log = logging.getLogger("storage")
 
 MAX_CHAPTER_BYTES = 50 * 1024 * 1024      # sanity bound for one chapter file
 UTF8_BOM = b"\xef\xbb\xbf"
-COPYABLE_JOB_STATUSES = {"completed", "completed_with_errors"}
 
 JOB_ID_RE = re.compile(r"^[a-f0-9]{12}$")
 CHAPTER_FILE_RE = re.compile(r"^(\d+)\.txt$")
@@ -89,10 +88,6 @@ class NoSuccessfulChaptersError(FileManagerError):
 
 class ChapterNotFoundError(FileManagerError):
     """The chapter number isn't part of this job."""
-
-
-class ExtractionIncompleteError(FileManagerError):
-    """The job hasn't finished (or didn't finish normally)."""
 
 
 class ChapterUnavailableError(FileManagerError):
@@ -683,22 +678,21 @@ class FileManager:
         """
         The verified raw bytes of one chapter's TXT file, for the content API.
 
-        Every check runs against the very bytes that are returned (read once),
-        so the file can't change between verification and delivery:
-        job finished normally, chapter successful in the pipeline manifest,
-        file inside the job's output folder, recorded size and SHA-256 match,
-        and the bytes are valid UTF-8.
+        A chapter can be read as soon as the pipeline has recorded it as
+        successful, even while the rest of the job is still running: the
+        pipeline writes N.txt atomically and only then records the chapter as
+        a success together with its size and SHA-256. Every check runs against
+        the very bytes that are returned (read once), so the file can't change
+        between verification and delivery: chapter successful in the pipeline
+        manifest, file inside the job's output folder, recorded size and
+        SHA-256 match, and the bytes are valid UTF-8.
 
         The text is not altered. Like PowerShell's
         `Get-Content -Encoding UTF8 -Raw`, a leading UTF-8 byte-order mark
         (which the pipeline never writes) is not part of the content.
         """
 
-        meta = self.read_job(job_id)
-
-        if meta.get("status") not in COPYABLE_JOB_STATUSES:
-            raise ExtractionIncompleteError(
-                "The extraction has not finished successfully yet.")
+        self.read_job(job_id)                # raises JobNotFoundError
 
         if (not isinstance(chapter_number, int) or isinstance(chapter_number, bool)
                 or chapter_number < 1):
@@ -710,6 +704,10 @@ class FileManager:
 
         if entry is None:
             raise ChapterNotFoundError("Chapter not found.")
+
+        if entry.get("status") in ("pending", "in_progress"):
+            raise ChapterUnavailableError(
+                "This chapter hasn't been extracted yet.")
 
         if entry.get("status") != "success":
             raise ChapterUnavailableError("This chapter was not extracted.")

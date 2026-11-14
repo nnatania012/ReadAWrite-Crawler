@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { formatBytes } from "../lib/format";
-import { isFinishedForCopy } from "../types";
+import { isTerminal } from "../types";
 import type { ChapterInfo, ChapterStatus, JobStatus } from "../types";
 import { CopyButton } from "./CopyButton";
 import { ChapterStatusBadge } from "./StatusBadge";
@@ -23,12 +23,19 @@ const MATCH: Record<Filter, (s: ChapterStatus) => boolean> = {
 
 const PAGE = 100;
 
-function disabledReason(jobStatus: JobStatus, chapter: ChapterInfo): string {
-  if (!isFinishedForCopy(jobStatus)) {
-    return "Available once the whole extraction has completed";
+/** Why a chapter's Copy button is disabled (shown as a tooltip). */
+function disabledReason(chapter: ChapterInfo): string {
+  if (chapter.status === "pending" || chapter.status === "processing") {
+    return "Available as soon as this chapter has been extracted";
   }
   if (chapter.status !== "success") return "This chapter wasn't extracted";
   return "This chapter can't be copied right now";
+}
+
+/** "Unavailable": the chapter failed, or the job is over and it never succeeded. */
+function isUnavailable(chapter: ChapterInfo, jobStatus: JobStatus): boolean {
+  if (chapter.status === "failed" || chapter.status === "partial") return true;
+  return isTerminal(jobStatus) && chapter.status !== "success";
 }
 
 export function ChapterList({
@@ -110,9 +117,9 @@ export function ChapterList({
                 <CopyButton
                   jobId={jobId}
                   chapterNumber={chapter.number}
-                  enabled={chapter.copyable && isFinishedForCopy(jobStatus)}
-                  unavailable={isFinishedForCopy(jobStatus) && chapter.status !== "success"}
-                  disabledReason={disabledReason(jobStatus, chapter)}
+                  enabled={chapter.copyable}
+                  unavailable={isUnavailable(chapter, jobStatus)}
+                  disabledReason={disabledReason(chapter)}
                 />
               </div>
               {chapter.error && (

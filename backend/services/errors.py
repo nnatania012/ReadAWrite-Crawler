@@ -63,11 +63,6 @@ class ChapterNotFound(ServiceError):
     code = "chapter_not_found"
 
 
-class ExtractionIncomplete(ServiceError):
-    status_code = 409
-    code = "extraction_incomplete"
-
-
 class ChapterUnavailable(ServiceError):
     status_code = 409
     code = "chapter_unavailable"

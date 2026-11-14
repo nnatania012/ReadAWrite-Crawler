@@ -7,8 +7,6 @@ function describeApiError(error: ApiError): string {
   switch (error.code) {
     case "chapter_not_found":
       return "This chapter wasn't found.";
-    case "extraction_incomplete":
-      return "Chapters can be copied once the extraction has finished.";
     case "chapter_unavailable":
       return error.message || "This chapter isn't available to copy.";
     case "job_expired":
@@ -58,7 +56,7 @@ const Icon = ({ phase }: { phase: Phase }) => {
 interface Props {
   jobId: string;
   chapterNumber: number;
-  /** Backend-confirmed: job finished and this chapter is intact. */
+  /** Backend-confirmed: this chapter is extracted and intact (the job may still be running). */
   enabled: boolean;
   /** Shown as "Unavailable" instead of "Copy" (chapter can never be copied). */
   unavailable: boolean;

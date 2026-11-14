@@ -316,3 +316,50 @@ def test_cors_only_allows_configured_origin(client):
     assert ok.headers.get("access-control-allow-origin") == "http://localhost:5173"
     bad = client.get("/api/health", headers={"Origin": "http://evil.example"})
     assert "access-control-allow-origin" not in bad.headers
+
+
+# --------------------------------------------- copy while the job is running
+
+def test_chapter_can_be_copied_as_soon_as_it_is_extracted_not_when_the_job_ends(client, adapter):
+    hold = threading.Event()
+    texts = {1: "ตอนที่ 1 \r\n\n  text 😀 \n".encode()}
+    adapter.plan(URL, statuses=["success", "success", "success", "success"], hold=hold, texts=texts)
+    job_id = create(client).json()["job_id"]
+
+    def listing():
+        return {c["number"]: c for c in
+                client.get(f"/api/jobs/{job_id}/chapters").json()["chapters"]}
+
+    wait_for(lambda: listing().get(1, {}).get("copyable") is True)
+    job = client.get(f"/api/jobs/{job_id}").json()
+    assert job["status"] == "processing"                       # still running...
+    chapters = listing()
+    assert chapters[1]["copyable"] is True                     # ...but chapter 1 is ready
+    assert chapters[2]["copyable"] is False and chapters[2]["status"] == "processing"
+    assert chapters[3]["copyable"] is False and chapters[4]["copyable"] is False
+
+    first = client.get(f"/api/jobs/{job_id}/chapters/1/content")
+    assert first.status_code == 200 and first.content == texts[1]
+    refused = client.get(f"/api/jobs/{job_id}/chapters/2/content")
+    assert refused.status_code == 409 and refused.json()["error"]["code"] == "chapter_unavailable"
+    assert client.get(f"/api/jobs/{job_id}/download").status_code == 409   # the ZIP still waits
+
+    hold.set()                                                  # the rest finishes
+    wait_status(client, job_id, "completed")
+    assert all(c["copyable"] for c in listing().values())
+    assert client.get(f"/api/jobs/{job_id}/chapters/2/content").status_code == 200
+    assert client.get(f"/api/jobs/{job_id}/chapters/1/content").content == texts[1]
+    assert client.get(f"/api/jobs/{job_id}/download").status_code == 200
+
+
+def test_chapters_stay_copyable_after_a_cancel(client, adapter):
+    hold = threading.Event()
+    adapter.plan(URL, statuses=["success"] * 4, hold=hold)
+    job_id = create(client).json()["job_id"]
+    wait_for(lambda: client.get(f"/api/jobs/{job_id}/chapters").json()["chapters"][0:1]
+             and client.get(f"/api/jobs/{job_id}/chapters").json()["chapters"][0]["copyable"])
+    client.post(f"/api/jobs/{job_id}/cancel")
+    wait_for(lambda: adapter.started[0].stop_file.exists())     # the stop request was delivered
+    hold.set()
+    wait_status(client, job_id, "cancelled")
+    assert client.get(f"/api/jobs/{job_id}/chapters/1/content").status_code == 200
